@@ -1,0 +1,86 @@
+
+WHENEVER OSERROR EXIT 1 ROLLBACK
+WHENEVER SQLERROR EXIT 100 ROLLBACK
+
+INSERT into WK_BATCH_TRACKER
+(RUN_NO, STEP_NAME, START_TIME, END_TIME, RUN_STATUS, ACTIVE_FLAG)
+values (to_char(sysdate,'YYYYMMDD'),'RDS SUSPEND',systimestamp,NULL,'R','Y');
+COMMIT;
+
+TRUNCATE TABLE  stg_rds_suspend_tbl reuse storage;
+
+PROMPT "RDS SUSPEND: Insert into stg_rds_suspend_tbl"
+
+INSERT INTO stg_rds_suspend_tbl
+( SUS_TICKET_NUMBER,SUS_PROCESS_DATE,SUS_PROCESS_TIME,SUS_CODE, SUS_DATE,
+SUS_UNTIL_DATE,SUS_COMMENTS,SUS_CLERK_ID, sus_tims_date_time )
+select  TICK_NUMBER,SUS_PROCESS_DATE,SUS_PROCESS_TIME,SUS_CODE,SUS_DATE,
+SUS_UNTIL_DATE,SUS_COMMENTS,SUS_CLERK_ID, sus_tims_date_time 
+from 
+(
+  select RANK () over (partition by  tick_number,SUS_PROCESS_DATE,SUS_PROCESS_TIME,SUS_CODE 
+	order by sus_tims_date_time desc, etl_seq_cd DESC) rec_no,
+	TICK_NUMBER,SUS_PROCESS_DATE,SUS_PROCESS_TIME,SUS_CODE,SUS_DATE,
+	SUS_UNTIL_DATE,SUS_COMMENTS,SUS_CLERK_ID, sus_tims_date_time 
+  from  (SELECT
+	    TICKET_NUMBER tick_number, TO_DATE(CASE WHEN NVL(SUSPEND_PROCESS_DTE,0)=0 THEN 1950365 
+	      else SUSPEND_PROCESS_DTE END,'YYYYDDD') SUS_PROCESS_DATE,
+             24000 - BATCH_TIME SUS_PROCESS_TIME, SUSPEND_CODE SUS_CODE,
+             TO_DATE(CASE WHEN batch_date IN (0,9999999) THEN 1950365 ELSE 9999999-batch_date END,'YYYYDDD') SUS_DATE,
+             TO_DATE(CASE WHEN SUSPEND_TIL_DATE=0 THEN 1950365 else SUSPEND_TIL_DATE END,'YYYYDDD') SUS_UNTIL_DATE,
+             NULL SUS_COMMENTS, CLERK_ID SUS_clerk_id, tims_timestamp sus_tims_date_time, etl_seq_cd
+	    from todays_tm2_ticket_hist
+	    WHERE trans_code LIKE '09_' AND TICKET_NUMBER > '0' AND SUSpend_CODE > '0' AND SUSPEND_PROCESS_DTE IS NOT NULL
+	    UNION 
+	    SELECT S.TICK_NUMBER,
+             TO_DATE(CASE WHEN NVL(SUSPEND_PROCESS_DTE,0) = 0 THEN 1950365 else SUSPEND_PROCESS_DTE END,'YYYYDDD') SUS_PROCESS_DATE,
+             S.SUSPEND_TIME SUS_PROCESS_TIME, S.SUSPEND_CODE SUS_CODE,
+             TO_DATE(CASE WHEN NVL(SUSPEND_DATE,0) = 0 THEN 1950365 else SUSPEND_DATE END,'YYYYDDD') SUS_DATE,
+             TO_DATE(CASE WHEN SUSPEND_TIL_DTE = 0 THEN 1950365 else SUSPEND_TIL_DTE END,'YYYYDDD') SUS_UNTIL_DATE,
+             S.SUSP_COMMENTS SUS_COMMENTS, S.SUSPEND_CLRK_ID SUS_clerk_id, tims_timestamp sus_tims_date_time, etl_seq_cd
+	    from todays_catchup_tick_segment2 S
+	    WHERE TICK_NUMBER > '0' AND SUSpend_CODE > '0' AND SUSPEND_PROCESS_DTE > 0 AND SUSPEND_TIME > 0
+	)
+) where rec_no = 1;
+
+COMMIT;
+
+PROMPT "Delete-Insert rds_suspend_tbl"
+
+delete from rds_suspend_tbl where ( SUS_TICKET_NUMBER,SUS_PROCESS_DATE,SUS_PROCESS_TIME,SUS_CODE )
+IN ( select SUS_TICKET_NUMBER,SUS_PROCESS_DATE,SUS_PROCESS_TIME,SUS_CODE from stg_rds_suspend_tbl );
+
+insert into rds_suspend_tbl
+( SUS_TICKET_NUMBER,SUS_PROCESS_DATE,SUS_PROCESS_TIME,SUS_CODE ,SUS_DATE,
+SUS_UNTIL_DATE,SUS_COMMENTS,SUS_CLERK_ID, sus_tims_date_time )
+select  SUS_TICKET_NUMBER,SUS_PROCESS_DATE,SUS_PROCESS_TIME,SUS_CODE ,SUS_DATE,
+SUS_UNTIL_DATE,SUS_COMMENTS,SUS_CLERK_ID, sus_tims_date_time from stg_rds_suspend_tbl;
+
+COMMIT;
+
+PROMPT "Update status steps.."
+
+UPDATE todays_catchup_tick_segment2 
+SET ETL_STATUS_CD = 16 WHERE ETL_STATUS_CD = 15;
+COMMIT;
+
+UPDATE todays_tm2_ticket_hist 
+SET ETL_STATUS_CD = 20 WHERE ETL_STATUS_CD = 15 and trans_code LIKE '09_'
+AND TICKET_NUMBER > '0' AND SUSpend_CODE > '0' AND NVL(SUSPEND_PROCESS_DTE, 0) <> 0;
+COMMIT;
+
+UPDATE stg_columbus_dtl.TM2_TICKET_HISTORY@stg_dblink 
+SET ETL_STATUS_CD = 20 WHERE ETL_STATUS_CD = 10 and trans_code LIKE '09_'
+AND TICKET_NUMBER > '0' AND SUSpend_CODE > '0' AND NVL(SUSPEND_PROCESS_DTE, 0) <> 0;
+COMMIT;
+
+UPDATE stg_columbus_dtl.TICK_SEGMENT@stg_dblink
+SET ETL_STATUS_CD = 25 WHERE ETL_STATUS_CD = 15 and tick_number in 
+	(select sus_ticket_number from stg_rds_suspend_tbl);
+COMMIT;
+
+update WK_BATCH_TRACKER set end_time=systimestamp, run_status='Y' where STEP_NAME='RDS SUSPEND';
+COMMIT;
+
+EXIT;
+
